@@ -323,3 +323,146 @@ Throughout the pipeline, we follow the principle: *"Train and test data must hav
 | **Scaling** | Mean/std computed from training set only; applied to test set |
 | **Cross-validation** | From-scratch implementation re-fits imputer and scaler inside each fold using only that fold's training portion |
 | **Hyperparameter tuning** | GridSearchCV runs its own internal CV on the training set; the test set is never seen during tuning |
+
+---
+
+## Improvement 1: Expanded Logistic Regression with L1 Penalty
+
+### Problem identified
+
+Logistic Regression was the weakest model in the pipeline, with a recall of just 89.58% (5 missed malignant cases out of 48). The original configuration only used L2 regularization (`penalty="l2"`) with the `lbfgs` solver, which limited the model's ability to perform feature selection.
+
+### What changed
+
+A second Logistic Regression variant was added using L1 regularization:
+
+```python
+"Logistic Regression (L1)": LogisticRegression(
+    solver="liblinear", penalty="l1", max_iter=1000,
+    class_weight="balanced", random_state=14)
+```
+
+The hyperparameter grid was also expanded to search over both penalties:
+
+| Parameter | L2 grid | L1 grid |
+|-----------|---------|---------|
+| `C` | 0.01, 0.1, 1.0, 10.0, 100.0 | 0.01, 0.1, 1.0, 10.0, 100.0 |
+| `penalty` | l2 | l1 |
+| `class_weight` | None, balanced | None, balanced |
+
+### Why L1 (Lasso) regularization
+
+L1 and L2 regularization both add a penalty term to the loss function to prevent overfitting, but they work differently:
+
+- **L2 (Ridge)** adds the sum of squared coefficients to the loss. This shrinks all coefficients toward zero proportionally but never eliminates any. It uses the `lbfgs` solver (a quasi-Newton optimization method).
+
+- **L1 (Lasso)** adds the sum of absolute coefficients to the loss. This can shrink coefficients all the way to exactly zero, effectively removing those features from the model. It requires the `liblinear` solver (a coordinate descent method that handles the non-differentiable L1 penalty).
+
+L1 is valuable because it performs **embedded feature selection** — if some of the 9 features are noise or redundant, L1 will zero them out automatically. This can produce a simpler, more interpretable model.
+
+### Why `liblinear` solver
+
+The `lbfgs` solver (used for L2) does not support L1 regularization because L1's absolute value function is not differentiable at zero, which breaks gradient-based optimization. The `liblinear` solver uses coordinate descent, which handles L1 natively by optimizing one coefficient at a time.
+
+### Results
+
+GridSearchCV selected `C=0.1` with `class_weight="balanced"` for L1, applying stronger regularization than L2's best (`C=1.0`). Despite this, the L1 model achieved identical test performance to L2:
+
+| Variant | Accuracy | Precision | Recall | F1 | AUC-ROC |
+|---------|----------|-----------|--------|-----|---------|
+| LR (L2) | 0.9714 | 0.9783 | 0.9375 | 0.9574 | 0.9964 |
+| LR (L1) | 0.9714 | 0.9783 | 0.9375 | 0.9574 | 0.9966 |
+
+The feature importance plot shows that L1 kept all 9 features non-zero, confirming that every cytological feature in this dataset carries meaningful predictive signal. The coefficient magnitudes are more compressed under L1 (due to the lower `C`), but the ranking remains similar: `Bare_nuclei` and `Clump_thickness` remain the strongest predictors.
+
+---
+
+## Improvement 2: Class Weight Balancing
+
+### Problem identified
+
+The dataset has a moderate class imbalance: 458 benign samples (65.5%) vs. 241 malignant samples (34.5%). By default, scikit-learn classifiers treat all samples equally during training, which means the model optimizes more for the majority class (benign). This was evident in Logistic Regression's low recall — the model was biased toward predicting benign, causing it to miss malignant cases.
+
+In a clinical context, this bias is dangerous. A false negative (missed cancer) has far worse consequences than a false positive (an unnecessary follow-up biopsy).
+
+### What changed
+
+The `class_weight="balanced"` parameter was added to all three classifiers and included in the hyperparameter search grid:
+
+```python
+LogisticRegression(..., class_weight="balanced")
+SVC(..., class_weight="balanced")
+RandomForestClassifier(..., class_weight="balanced")
+```
+
+For Random Forest, a third option `"balanced_subsample"` was also searched. This recomputes weights for each tree based on the bootstrap sample rather than the full dataset.
+
+### How `class_weight="balanced"` works
+
+When set to `"balanced"`, scikit-learn automatically adjusts the weight of each class inversely proportional to its frequency:
+
+```
+weight_class = n_samples / (n_classes * n_samples_in_class)
+```
+
+For this dataset:
+- **Benign weight** = 699 / (2 * 458) = **0.76**
+- **Malignant weight** = 699 / (2 * 241) = **1.45**
+
+This means misclassifying a malignant sample incurs approximately 1.9x the penalty of misclassifying a benign sample. The effect on each model:
+
+- **Logistic Regression**: The weighted samples shift the decision boundary. Malignant errors contribute more to the log-loss, so the optimizer finds a boundary that catches more malignant cases (higher recall) even if it means a few more false positives.
+
+- **SVM**: The `C` parameter (misclassification penalty) is scaled per class. Effectively, `C_malignant = C * 1.45` and `C_benign = C * 0.76`. The support vectors shift to create a wider margin on the malignant side.
+
+- **Random Forest**: At each tree split, the Gini impurity calculation weights samples by their class weight. Splits that correctly separate malignant samples are rewarded more, so the trees prioritize getting malignant classifications right.
+
+### Results
+
+GridSearchCV selected `class_weight="balanced"` as optimal for **every model**, confirming that addressing the imbalance helps universally.
+
+#### Logistic Regression — before vs. after balancing
+
+| Metric | Before (no balancing) | After (balanced) | Change |
+|--------|----------------------|------------------|--------|
+| Accuracy | 0.9571 | **0.9714** | +1.4% |
+| Precision | 0.9773 | 0.9783 | +0.1% |
+| Recall | 0.8958 | **0.9375** | **+4.2%** |
+| F1 | 0.9348 | **0.9574** | +2.3% |
+| False negatives | 5 | **3** | -2 missed cancers |
+
+The most significant improvement: recall jumped from 89.58% to 93.75%, reducing missed malignant cases from 5 to 3.
+
+#### Random Forest — recall champion
+
+With balanced weights, Random Forest achieved the highest recall of all models:
+
+| Metric | Value |
+|--------|-------|
+| Recall | **0.9792** (only 1 missed cancer out of 48) |
+| Precision | 0.9400 (3 false positives) |
+| F1 | 0.9592 |
+
+This makes Random Forest the most clinically conservative model — it flags nearly every malignant case at the cost of slightly more false alarms.
+
+#### Updated model comparison
+
+| Model | Accuracy | Precision | Recall | F1 Score | AUC-ROC |
+|-------|----------|-----------|--------|----------|---------|
+| Logistic Regression (L2) | 0.9714 | 0.9783 | 0.9375 | 0.9574 | 0.9964 |
+| Logistic Regression (L1) | 0.9714 | 0.9783 | 0.9375 | 0.9574 | 0.9966 |
+| SVM (RBF kernel) | 0.9786 | 0.9787 | 0.9583 | 0.9684 | 0.9968 |
+| Random Forest | 0.9714 | 0.9400 | **0.9792** | 0.9592 | 0.9966 |
+
+### Updated visualizations
+
+The `model_comparison.png` figure now includes confusion matrices for all four models (LR L2, LR L1, SVM, Random Forest) and the ROC curve panel shows four overlapping curves with AUC values above 0.996 for all.
+
+The `feature_importance.png` figure now has three panels:
+1. **LR (L2) coefficients** — all 9 features non-zero, `Bare_nuclei` dominant
+2. **LR (L1) coefficients** — all 9 features non-zero (red bars indicate zeroed-out features; none were eliminated), confirming all features are informative
+3. **Random Forest Gini importance** — `Uniformity_of_cell_size` dominant, with a more spread distribution across features compared to LR
+
+### Key takeaway
+
+Class weight balancing is a simple, zero-cost improvement for imbalanced medical datasets. It requires no additional data, no new features, and no architectural changes — just a single parameter. The trade-off it makes (slightly more false positives in exchange for fewer false negatives) aligns perfectly with the clinical priority of catching every cancer case.

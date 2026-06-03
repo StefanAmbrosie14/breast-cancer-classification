@@ -121,10 +121,26 @@ def kfold_cross_validate(X, y, model_fn, k=5, random_state=14):
 
 
 # Models to evaluate — each entry is a factory function returning a fresh instance
+# class_weight="balanced" automatically upweights the minority class (malignant)
+# by setting weights inversely proportional to class frequencies:
+#   w_class = n_samples / (n_classes * n_samples_class)
+#   benign weight  ≈ 699 / (2 * 458) ≈ 0.76
+#   malignant weight ≈ 699 / (2 * 241) ≈ 1.45
+# This penalizes misclassifying malignant samples ~1.9x more than benign,
+# pushing the models to improve recall (catch more cancers).
 baseline_models = {
-    "Logistic Regression": lambda: LogisticRegression(solver="lbfgs", max_iter=1000, random_state=14),
-    "SVM (RBF kernel)":    lambda: SVC(kernel="rbf", probability=True, random_state=14),
-    "Random Forest":       lambda: RandomForestClassifier(n_estimators=100, random_state=14),
+    "Logistic Regression (L2)": lambda: LogisticRegression(
+        solver="lbfgs", penalty="l2", max_iter=1000,
+        class_weight="balanced", random_state=14),
+    "Logistic Regression (L1)": lambda: LogisticRegression(
+        solver="liblinear", penalty="l1", max_iter=1000,
+        class_weight="balanced", random_state=14),
+    "SVM (RBF kernel)": lambda: SVC(
+        kernel="rbf", probability=True,
+        class_weight="balanced", random_state=14),
+    "Random Forest": lambda: RandomForestClassifier(
+        n_estimators=100,
+        class_weight="balanced", random_state=14),
 }
 
 print("=" * 60)
@@ -145,12 +161,26 @@ print(f"\n{'=' * 60}")
 print(" STEP 7: Hyperparameter Tuning (GridSearchCV, 5-fold)")
 print("=" * 60)
 
+# Logistic Regression: two separate grids because lbfgs supports L2 only,
+# while liblinear supports both L1 and L2.
+# L1 penalty can zero out weak features entirely (embedded feature selection).
+# L2 penalty shrinks all coefficients but keeps them non-zero.
+# class_weight is tuned: None (default equal weights) vs "balanced" (auto-upweight minority).
 param_grids = {
-    "Logistic Regression": {
+    "Logistic Regression (L2)": {
         "model": LogisticRegression(solver="lbfgs", max_iter=1000, random_state=14),
         "params": {
             "C": [0.01, 0.1, 1.0, 10.0, 100.0],
             "penalty": ["l2"],
+            "class_weight": [None, "balanced"],
+        },
+    },
+    "Logistic Regression (L1)": {
+        "model": LogisticRegression(solver="liblinear", max_iter=1000, random_state=14),
+        "params": {
+            "C": [0.01, 0.1, 1.0, 10.0, 100.0],
+            "penalty": ["l1"],
+            "class_weight": [None, "balanced"],
         },
     },
     "SVM (RBF kernel)": {
@@ -158,6 +188,7 @@ param_grids = {
         "params": {
             "C": [0.1, 1.0, 10.0, 100.0],
             "gamma": ["scale", "auto", 0.01, 0.1],
+            "class_weight": [None, "balanced"],
         },
     },
     "Random Forest": {
@@ -166,6 +197,7 @@ param_grids = {
             "n_estimators": [50, 100, 200],
             "max_depth": [None, 5, 10, 20],
             "min_samples_split": [2, 5, 10],
+            "class_weight": [None, "balanced", "balanced_subsample"],
         },
     },
 }
@@ -223,9 +255,10 @@ comparison = pd.DataFrame(results).set_index("Model")
 print(comparison.round(4).to_string())
 
 #VISUALIZATIONS
-fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+n_models = len(best_models)
+fig, axes = plt.subplots(2, 3, figsize=(18, 11))
 
-# 10a. ROC Curves
+# ROC Curves (top-left, spanning focus)
 ax = axes[0, 0]
 for name, (fpr, tpr, auc) in roc_data.items():
     ax.plot(fpr, tpr, linewidth=2, label=f"{name} (AUC={auc:.3f})")
@@ -233,13 +266,13 @@ ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Random classifier")
 ax.set_xlabel("False Positive Rate")
 ax.set_ylabel("True Positive Rate")
 ax.set_title("ROC Curves")
-ax.legend(loc="lower right", fontsize=9)
+ax.legend(loc="lower right", fontsize=8)
 ax.grid(alpha=0.3)
 
-# Confusion Matrices
+# Confusion Matrices (remaining slots)
+cm_axes = [axes[0, 1], axes[0, 2], axes[1, 0], axes[1, 1]]
 for idx, (name, model) in enumerate(best_models.items()):
-    row, col = divmod(idx + 1, 2)
-    ax = axes[row, col]
+    ax = cm_axes[idx]
     y_pred = model.predict(X_test)
     ConfusionMatrixDisplay.from_predictions(
         y_test, y_pred,
@@ -247,28 +280,40 @@ for idx, (name, model) in enumerate(best_models.items()):
         cmap="Blues",
         ax=ax,
     )
-    ax.set_title(f"Confusion Matrix — {name}")
+    ax.set_title(f"CM — {name}", fontsize=10)
+
+# Hide unused subplot if any
+if n_models < 5:
+    axes[1, 2].axis("off")
 
 plt.tight_layout()
 plt.savefig("model_comparison.png", dpi=150, bbox_inches="tight")
 print("\nSaved: model_comparison.png")
 
-# Feature Importance
-fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
+# Feature Importance — 3 panels: LR (L2), LR (L1), Random Forest
+fig2, axes2 = plt.subplots(1, 3, figsize=(18, 5))
 
-# Logistic Regression coefficients (absolute value)
-lr = best_models["Logistic Regression"]
-lr_importance = pd.Series(np.abs(lr.coef_[0]), index=X.columns).sort_values()
-lr_importance.plot.barh(ax=axes2[0], color="steelblue")
-axes2[0].set_title("Logistic Regression — |Coefficients|")
+# Logistic Regression L2 coefficients
+lr_l2 = best_models["Logistic Regression (L2)"]
+lr_l2_imp = pd.Series(np.abs(lr_l2.coef_[0]), index=X.columns).sort_values()
+lr_l2_imp.plot.barh(ax=axes2[0], color="steelblue")
+axes2[0].set_title("LR (L2) — |Coefficients|")
 axes2[0].set_xlabel("Absolute Coefficient Value")
+
+# Logistic Regression L1 coefficients — shows which features get zeroed out
+lr_l1 = best_models["Logistic Regression (L1)"]
+lr_l1_imp = pd.Series(np.abs(lr_l1.coef_[0]), index=X.columns).sort_values()
+colors = ["lightcoral" if v == 0 else "steelblue" for v in lr_l1_imp]
+lr_l1_imp.plot.barh(ax=axes2[1], color=colors)
+axes2[1].set_title("LR (L1) — |Coefficients|  (red = zeroed out)")
+axes2[1].set_xlabel("Absolute Coefficient Value")
 
 # Random Forest feature importance (Gini)
 rf = best_models["Random Forest"]
 rf_importance = pd.Series(rf.feature_importances_, index=X.columns).sort_values()
-rf_importance.plot.barh(ax=axes2[1], color="forestgreen")
-axes2[1].set_title("Random Forest — Gini Importance")
-axes2[1].set_xlabel("Importance")
+rf_importance.plot.barh(ax=axes2[2], color="forestgreen")
+axes2[2].set_title("Random Forest — Gini Importance")
+axes2[2].set_xlabel("Importance")
 
 plt.tight_layout()
 plt.savefig("feature_importance.png", dpi=150, bbox_inches="tight")
