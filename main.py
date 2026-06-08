@@ -255,40 +255,56 @@ comparison = pd.DataFrame(results).set_index("Model")
 print(comparison.round(4).to_string())
 
 #VISUALIZATIONS
-n_models = len(best_models)
-fig, axes = plt.subplots(2, 3, figsize=(18, 11))
 
-# ROC Curves (top-left, spanning focus)
-ax = axes[0, 0]
+# ROC Curves — standalone figure
+fig_roc, ax_roc = plt.subplots(figsize=(8, 6))
 for name, (fpr, tpr, auc) in roc_data.items():
-    ax.plot(fpr, tpr, linewidth=2, label=f"{name} (AUC={auc:.3f})")
-ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Random classifier")
-ax.set_xlabel("False Positive Rate")
-ax.set_ylabel("True Positive Rate")
-ax.set_title("ROC Curves")
-ax.legend(loc="lower right", fontsize=8)
-ax.grid(alpha=0.3)
+    ax_roc.plot(fpr, tpr, linewidth=2, label=f"{name} (AUC={auc:.3f})")
+ax_roc.plot([0, 1], [0, 1], "k--", linewidth=1, label="Random classifier")
+ax_roc.set_xlabel("False Positive Rate")
+ax_roc.set_ylabel("True Positive Rate")
+ax_roc.set_title("ROC Curves")
+ax_roc.legend(loc="lower right", fontsize=9)
+ax_roc.grid(alpha=0.3)
+fig_roc.tight_layout()
+fig_roc.savefig("roc_curves.png", dpi=150, bbox_inches="tight")
+print("\nSaved: roc_curves.png")
 
-# Confusion Matrices (remaining slots)
-cm_axes = [axes[0, 1], axes[0, 2], axes[1, 0], axes[1, 1]]
-for idx, (name, model) in enumerate(best_models.items()):
-    ax = cm_axes[idx]
+# Confusion Matrices — one file per model, absolute + normalized side by side
+for name, model in best_models.items():
     y_pred = model.predict(X_test)
+
+    fig_cm, (ax_abs, ax_norm) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Left: absolute counts
     ConfusionMatrixDisplay.from_predictions(
         y_test, y_pred,
         display_labels=["Benign", "Malignant"],
         cmap="Blues",
-        ax=ax,
+        ax=ax_abs,
     )
-    ax.set_title(f"CM — {name}", fontsize=10)
+    ax_abs.set_title("Absolute Counts")
 
-# Hide unused subplot if any
-if n_models < 5:
-    axes[1, 2].axis("off")
+    # Right: normalized (percentages per true class)
+    ConfusionMatrixDisplay.from_predictions(
+        y_test, y_pred,
+        display_labels=["Benign", "Malignant"],
+        normalize="true",
+        values_format=".1%",
+        cmap="Blues",
+        ax=ax_norm,
+    )
+    ax_norm.set_title("Normalized (per true class)")
 
-plt.tight_layout()
-plt.savefig("model_comparison.png", dpi=150, bbox_inches="tight")
-print("\nSaved: model_comparison.png")
+    fig_cm.suptitle(f"Confusion Matrix — {name}", fontsize=14, fontweight="bold")
+    fig_cm.tight_layout()
+
+    # Clean filename: lowercase, spaces/parens to underscores
+    safe_name = name.lower().replace(" ", "_").replace("(", "").replace(")", "")
+    filename = f"confusion_matrix_{safe_name}.png"
+    fig_cm.savefig(filename, dpi=150, bbox_inches="tight")
+    print(f"Saved: {filename}")
+    plt.close(fig_cm)
 
 # Feature Importance — 3 panels: LR (L2), LR (L1), Random Forest
 fig2, axes2 = plt.subplots(1, 3, figsize=(18, 5))
